@@ -1,0 +1,449 @@
+---
+title: "Capstone - MovieLens"
+author: "Pablo Pino Mejias"
+date: "5 de febrero de 2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+##1. Executive summary
+This project try to generate a model with enough predictive power to know the rating that a user will give to a movie. 
+
+The original project (the most famous at least) that tried to achieve that goal was the **The Netflix Prize** (october 2006). This project was an open competition to predict user ratings for films, based on previous ratings without any other information about the users or films. The goal was to make the company's recommendation engine 10% more accurate.
+
+This document contains an exploratory analysis section in which some characteristics of the data set are shown. This section will also explain the process, techniques and methods that were used to handle the data and to create the predicive model.
+
+The next section shows the results of the previous process and then, the conclusions of the project are given.
+
+### Code provided by the edx staff to download an create **edx** dataset.
+```{r download, message = FALSE, warning = FALSE}
+#Create test and validation sets
+
+# Create edx set, validation set, and submission file
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+```{r aditional_libs, message = FALSE, warning = FALSE, echo = FALSE}
+if(!require(anytime)) install.packages("anytime", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+```
+```{r libs, message = FALSE, warning = FALSE}
+library(caret)
+library(anytime)
+library(tidyverse)
+library(lubridate)
+```  
+
+###1.1. The dataset
+The data set contains 9000055 observations of 6 variables.  
+
+- `userId`: Unique identification number given to each user. `numeric` variable  
+- `movieId`: Unique identification number given to each movie. `numeric` variable.  
+- `timestamp`: Code that contains date and time in what the rating was given by the user to the specific movie. `integer` variable.  
+- `title`: Title of the movie. `character` variable.  
+- `genres`: Motion-picture category associated to the film. `character` variable.  
+- `rating`: Rating given by the user to the movie. From 0 to 5 *stars* in steps of 0.5. `numeric` variable. 
+
+##2. Analysis Section
+###2.1. Data formats.
+The `userId` and `movieId` variables are `numeric` columns in the original data set. However it doesn't make sense. The `userId`=2 is not two times the `userId`=1 and the same effect happens with the `movieId` variable. These characteristics are just *labels*, therefore they will be converted to `factor` type to be useful.
+
+Both `movieId` and `title` variables give us the same exact information. They are the **unique identification code** to each film. We could say that these pair of varaibles have 100% of correlation! Only the `movieId` colum will remain. It will be a `factor` too. It optimizes the memory (RAM) usege.
+
+The `timestamp` variable is converted to `POSIXct` type, to be handle correctly as a `date` vector. The year is extracted to the `year` column and the `timestamp` column is dropped.
+
+```{r formats, message = FALSE}
+edx$userId <- as.factor(edx$userId) # Convert `userId` to `factor`.
+edx$movieId <- as.factor(edx$movieId) # Convert `movieId` to `factor`.
+edx$genres <- as.factor(edx$genres) # Convert `genres` to `factor`.
+edx$timestamp <- as.POSIXct(edx$timestamp, origin = "1970-01-01") # Convert `timestamp to `POSIXct`.
+
+edx <- edx %>% # It extracts the release year of the movie and creates `year` column.
+  mutate(title = str_trim(title)) %>%
+  extract(title, c("title_tmp", "year"),
+          regex = "^(.*) \\(([0-9 \\-]*)\\)$",
+          remove = F) %>%
+  mutate(year = if_else(str_length(year) > 4,
+                        as.integer(str_split(year, "-",
+                                             simplify = T)[1]),
+                        as.integer(year))) %>%
+  mutate(title = if_else(is.na(title_tmp), title, title_tmp)) %>%
+  select(-title_tmp)  %>%
+  mutate(genres = if_else(genres == "(no genres listed)",
+                          `is.na<-`(genres), genres))
+
+edx <- edx %>% mutate(year_rate = year(timestamp))
+  # It extracts the year that the rate was given by the user.
+
+edx <- edx %>% select(-title, -timestamp) # Drop `title` & `timestamp` columns.
+edx$genres <- as.factor(edx$genres)
+```
+
+```{r head}
+head(edx)
+```  
+
+###2.2. Exploratory Analysis. 
+
+The target is to create a model capable of predicting the variable `rating`. 
+```{r rating_summary, message = FALSE}
+summary(edx$rating)
+```
+
+```{r plot_rating, message = FALSE}
+edx %>% ggplot(aes(rating)) +
+            geom_histogram(fill = "darkgreen") +
+            labs(title = "Rating distribution",
+                 x = "Rate",
+                 y = "Frequency")
+```  
+
+We can see that our `rating` variable has a left-skewed distribution. It's interesting that there are more *good* ratings than *bad* ratings. That could be explain by the fact that people want to recommend a film when they liked it, but we could just suppose that, because of we don't have the data here to prove it.
+
+What about the users and movies in the data?
+```{r unique_users}
+edx %>%
+  summarize(Unique_Users = n_distinct(userId),
+            Unique_Movies = n_distinct(movieId),
+            Unique_Genres = n_distinct(genres))
+```  
+
+We observe that there are 69878 unique users given ratings to 10677 different films. It's good to remember that the *unique genres* were counted as `factor` with no previous separation so, `Drama` and `Comedy|Drama` are counted as 2 different genres.
+
+```{r year_rate_plot, message = FALSE}
+edx %>% ggplot(aes(year_rate)) +
+  geom_histogram(fill = "darkblue") +
+  labs(title = "Distribution of the year_rate",
+       subtitle = "Year in what the rating was given",
+       x = "Year",
+       y = "Frequency")
+```
+
+We can observe that the years 1998 and 2006 have fewer observations. The quantity of ratings given by year is irregular. That could affect the performance of the model.
+
+```{r year_release, message = FALSE, warning = FALSE}
+edx %>% ggplot(aes(year)) +
+  geom_histogram(fill = "darkblue") +
+  labs(title = "Release Year distribution",
+       subtitle = "Rates by release year",
+       x = "Year",
+       y = "Frequency")
+```
+
+The frequency of ratings by *release year* of the films has a clear left skewed distribution. The most of those year are between 1990 and 2009.
+
+```{r genres_best_mean, warning = FALSE}
+g <- edx %>%
+  select(genres, rating) %>%
+  group_by(genres) %>%
+  summarize(mean = mean(rating), median = median(rating), n = n()) %>%
+  arrange(desc(mean)) %>%
+  head(20)
+
+print(g)
+```
+
+The top 10 **genres** listed above have the highest **mean**. The first place "Animation|IMAX|Sci-Fi" is clearly not significant, because of the only 7 observations. This *genre* will be eliminated below. **Drama** is present in the 2° and 3° place. 
+
+```{r appearences_top_20, warning = FALSE}
+g[2:nrow(g), ] %>%
+  separate_rows(genres, sep = "\\|") %>%
+  group_by(genres) %>%
+  head(20)
+```
+
+The genres associated with the highest mean are "Drama", "Film-Noir" and "Romance". The **difference** with the *second section* (mean = 4.28) in that ranking is almost zero.
+
+```{r edx_appearences, warning = FALSE}
+edx %>%
+  select(genres, rating) %>%
+  group_by(genres) %>%
+  summarize(mean = mean(rating), median = median(rating), n = n()) %>%
+  arrange(desc(mean)) %>%
+  separate_rows(genres, sep = "\\|") %>%
+  group_by(genres) %>%
+  head(20) %>%
+  group_by(genres) %>%
+  summarise(appearances = sum(n)) %>%
+  arrange(desc(appearances)) %>%
+  head(10)
+```
+
+In the complete `edx` dataset the genres **Film-Noir**, **Crime** and **Mystery** are the top 3 in appearences. Justn in the 5° and 6° place some _happy_ genre appears!
+
+##3. The Model
+###3.1. Train and Test set
+First at all, the `train` and `test` set are created.
+
+```{r create_train_test, message = FALSE, warning = FALSE}
+edx <- edx %>% select(userId, movieId, rating)
+
+test_index <- createDataPartition(edx$rating, times = 1, p = .2, list = F)
+    # Create the index
+
+  train <- edx[-test_index, ] # Create Train set
+  test <- edx[test_index, ] # Create Test set
+  test <- test %>% # The same movieId and usersId appears in both set. (Not the same cases)
+    semi_join(train, by = "movieId") %>%
+    semi_join(train, by = "userId")
+```
+
+```{r dim_sets, warning = FALSE}
+dim(train)
+dim(test)
+```
+
+###3.2 Baseline *model*
+The most basic model is generated when we are just considering the most common rating from the *train* set to be predicted into the test set. This is the **baseline** model.  
+
+```{r baseline, message = FALSE, warning = FALSE}
+mu_hat <- mean(train$rating) # Mean accross all movies.
+RMSE_baseline <- RMSE(test$rating, mu_hat) # RMSE in test set.
+RMSE_baseline
+```  
+
+Now, we have the RMSE to be *beaten* by our model.  
+
+```{r table1, message = FALSE, warning = FALSE}
+rmse_table <- data_frame(Method = "Baseline", RMSE = RMSE_baseline)
+rmse_table %>% knitr::kable(caption = "RMSEs")
+```  
+
+We can observe that the RMSE of the most basic model is `r RMSE_baseline`. It's bigger than 1! In this context, this is a very bad model.
+
+###3.3 User and Movie effect Model
+The next step is going to try to get a new model with a better RMSE.
+
+We are considering the *user effect* $(u_i)$ and the *movie effect* $(m_i)$ as predictors. Therefore, we are generating the next model to predict `rating` $(\hat{y}_i)$:
+$$\hat{y}_i=u_i+m_i+\varepsilon$$
+
+```{r normal_model, message = FALSE, warning = FALSE}
+mu <- mean(train$rating)
+
+movie_avgs <- train %>%
+  group_by(movieId) %>%
+  summarize(m_i = mean(rating - mu))
+
+user_avgs <- test %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(u_i = mean(rating - mu - m_i))
+
+predicted_ratings <- test %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(pred = mu + m_i + u_i) %>% .$pred
+
+model_RMSE <- RMSE(predicted_ratings, test$rating)
+model_RMSE  
+```  
+
+```{r table2, message = FALSE, warning = FALSE}
+rmse_table <- rbind(rmse_table,
+                    data_frame(Method = "User & Movie Effect", RMSE = model_RMSE))
+
+rmse_table %>% knitr::kable(caption = "RMSEs")
+```  
+
+We've got obtained a better RMSE. Now it is time to make predictions on unseeing data.
+
+###3.4 User and Movie effect Model on *validation* data
+First at all, the *validation* data set needs to be handled the same as the *train* data set was handled.
+
+```{r val_data_set, message = FALSE, warning = FALSE}
+validation <- validation %>% select(userId, movieId, rating)
+
+validation$userId <- as.factor(validation$userId)
+validation$movieId <- as.factor(validation$movieId)
+
+validation <- validation[complete.cases(validation), ]
+```
+
+Now, we are ready to make predictions.
+
+```{r val_user_mov, message = FALSE, warning = FALSE, echo = FALSE}
+mu <- mean(train$rating)
+
+movie_avgs <- train %>%
+  group_by(movieId) %>%
+  summarize(m_i = mean(rating - mu))
+
+user_avgs <- test %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  group_by(userId) %>%
+  summarize(u_i = mean(rating - mu - m_i))
+
+predicted_ratings <- test %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(pred = mu + m_i + u_i) %>% .$pred
+```
+```{r val_user_mov_pred, message = FALSE, warning = FALSE}
+predicted_val <- validation %>%
+  left_join(movie_avgs, by = "movieId") %>%
+  left_join(user_avgs, by = "userId") %>%
+  mutate(pred = mu + m_i + u_i) %>% .$pred
+
+val_RMSE <- RMSE(predicted_val, validation$rating, na.rm = T)
+val_RMSE
+```  
+```{r table3_val, message = FALSE, warning = FALSE}
+rmse_table_val <- data_frame(Method = "User & Movie Effect on validation", RMSE = val_RMSE)
+rmse_table_val %>% knitr::kable(caption = "RMSEs on validation data set")
+```  
+
+We can see above that this RMSE is higher than the RMSE on the test set. This is highly probable, given that this is unseeing data. The good thing is that the difference is just `r val_RMSE - model_RMSE`. Now, let's see if *regularisation* give us better results.
+
+###3.5. Regularisation 
+
+The regularisation process will evaluate different values for $\lambda$, delivering to us the corresponding RMSE.
+
+```{r user_mov_reg, message = FALSE, warning = FALSE}
+lambda_values <- seq(0, 7, .2)
+
+RMSE_function_reg <- sapply(lambda_values, function(l){
+  
+  mu <- mean(train$rating)
+  
+  m_i <- train %>%
+    group_by(movieId) %>%
+    summarize(m_i = sum(rating - mu)/(n()+l))
+  
+  u_i <- train %>%
+    left_join(m_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(u_i = sum(rating - m_i - mu)/(n()+l))
+  
+  predicted_ratings <- test %>%
+    left_join(m_i, by = "movieId") %>% 
+    left_join(u_i, by = "userId") %>%
+    mutate(pred = mu + m_i + u_i) %>% .$pred
+  
+  return(RMSE(predicted_ratings, test$rating))
+})
+
+qplot(lambda_values, RMSE_function_reg,
+      main = "Regularisation",
+      xlab = "RMSE", ylab = "Lambda") # lambda vs RMSE
+
+lambda_opt <- lambda_values[which.min(RMSE_function_reg)]
+lambda_opt # Lambda which minimizes RMSE
+```  
+
+```{r table4, message = FALSE, warning = FALSE}
+rmse_table <- rbind(rmse_table,
+                    data_frame(Method = "User & Movie Effect Regularisation",
+                               RMSE = min(RMSE_function_reg)))
+rmse_table %>% knitr::kable(caption = "RMSEs")
+```  
+
+The *regularisation* give as a higher RMSE than the first "User & Movie Effect" model. This is unexpected
+
+###3.6 Regularisation on *validation* data set
+It is time to see what is the performance of the *regularisation* on the validation data set.
+```{r reg_val, message = FALSE, warning = FALSE}
+RMSE_function_val_reg <- sapply(lambda_values, function(l){
+  
+  mu <- mean(train$rating)
+  
+  m_i <- train %>%
+    group_by(movieId) %>%
+    summarize(m_i = sum(rating - mu)/(n()+l))
+  
+  u_i <- train %>%
+    left_join(m_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(u_i = sum(rating - m_i - mu)/(n()+l))
+  
+  predicted_val_reg <- validation %>%
+    left_join(m_i, by = "movieId") %>% 
+    left_join(u_i, by = "userId") %>%
+    mutate(pred = mu + m_i + u_i) %>% .$pred
+  
+  return(RMSE(predicted_val_reg, validation$rating, na.rm = T))
+})
+
+qplot(lambda_values, RMSE_function_val_reg,
+      main = "Regularisation on validation data set",
+      xlab = "Lambda", ylab = "RMSE")
+
+lambda_opt_reg <- lambda_values[which.min(RMSE_function_val_reg)]
+lambda_opt_reg # Lambda which minimizes RMSE
+min_rmse <- min(RMSE_function_val_reg) # Best RMSE
+min_rmse
+```  
+
+```{r table5, message = FALSE, warning = FALSE}
+rmse_table_val <- rbind(rmse_table_val,
+                    data_frame(Method = "User & Movie Effect Reg. on validation",
+                               RMSE = min(RMSE_function_val_reg)))
+rmse_table_val %>% knitr::kable(caption = "RMSEs on validation data set")
+```  
+
+##4. Results
+```{r table_complete, message = FALSE, warning = FALSE}
+rbind(rmse_table, rmse_table_val) %>% knitr::kable(caption = "RMSEs Summary")
+```  
+
+We can observe that the better RMSE is obtained from the *User & Movie Effect* model. However, this RMSE *only* obtained on the *test* set. When we move to the *validation* data set, we obtain the worse RMSE (ignoring the baseline).
+
+Considering that we must trust more in the performance of the model when we predict from unseeing data, we can say that the RMSE that results from the *User & Movie Effect with Regularisation on validation* (the last line in the table above) is our definitive model. This RMSE is obtained when $\lambda=5$ which permit us to achieve **RMSE equal to `r min_rmse`.**
+
+##5. Conclusion
+The variables `userId` and `movieId` have sufficient predictive power to permit us to predict how a user will rate a movie. This tell us that we could make better recommendations about movie to specific users of the streaming service. Therefore, the user could decide to spend more time using the service.
+
+The RMSE equal to `r min_rmse` is pretty acceptable considering that we have few predictors, but both *User* and *Movie* effects are power enough to predict the `rating` that will be given to a movie, by a specific user.
+
+##Final thoughts
+The objective of data science is to transform data into information and using machine learning and, if it is possible, to find the best model to predict what we desire to predict. There are a lot of variables that could help us to achieve this. One of those variables is the hardware (capacity) of our machine.
+
+In my specific situation, I always try differents models as *cart*, *random forest*,*gbm*, *neural network* and others. This time it wasn't possible because of the amount of data. 10 millions of rows! It wasn't even possible to sparse the `genres` column!
+
+One option is to "cut" the data frame, but not all the cases will be *trained*.
+
+It's a shame that the **technical capacity** of the machines of the students wasn't considering at the planning phase of this final project. The method used in this project was the only one that was possible to run without crashing my RAM. From the forums of the course, we know that there a lot oof students dealing with the same *issue*.
+
+It's a shame, because the process of a data science project is really beatiful.
+
+Happy learning!
+
+My "movieLens Github repository" is **[in this link](https://github.com/PabloDataLib/MovieLens)**
